@@ -3,6 +3,7 @@ package emmq
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +27,7 @@ type (
 		PollInterval  time.Duration
 		PollBatchSize int
 		BadgerOptions badger.Options
-		OnError       func(badger.Logger, error)
+		OnError       func(error)
 	}
 
 	// PublishOptions represents message publish options
@@ -56,8 +57,8 @@ func Open(path string, optFns ...func(*Options)) (*Exchange, error) {
 		PollInterval:  100 * time.Millisecond,
 		PollBatchSize: 10,
 		BadgerOptions: badger.DefaultOptions(path),
-		OnError: func(l badger.Logger, err error) {
-			l.Errorf("%v", err)
+		OnError: func(err error) {
+			log.Println(err)
 		},
 	}
 
@@ -176,7 +177,7 @@ func (e *Exchange) Consume(ctx context.Context, topicPrefix string) (<-chan Deli
 			case <-t.C:
 				ds, err := e.pop(topicPrefix, e.opts.PollBatchSize)
 				if err != nil {
-					e.opts.OnError(e.db.Opts().Logger, err)
+					e.opts.OnError(err)
 					continue
 				}
 
