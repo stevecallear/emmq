@@ -184,26 +184,45 @@ func TestExchange_Redrive(t *testing.T) {
 	tests := []struct {
 		name   string
 		status emmq.Status
+		opts   func(*emmq.RedriveOptions)
 		exp    int32
 	}{
 		{
 			name:   "should not error on ready status",
 			status: emmq.StatusReady,
+			opts:   func(*emmq.RedriveOptions) {},
 		},
 		{
 			name:   "should redrive unacked status",
 			status: emmq.StatusUnacked,
+			opts:   func(*emmq.RedriveOptions) {},
 			exp:    messageCount / 2,
 		},
 		{
 			name:   "should redrive nacked status",
 			status: emmq.StatusNacked,
+			opts:   func(*emmq.RedriveOptions) {},
 			exp:    messageCount / 2,
 		},
 		{
 			name:   "should redrive unacked and nacked status",
 			status: emmq.StatusUnacked | emmq.StatusNacked,
+			opts:   func(*emmq.RedriveOptions) {},
 			exp:    messageCount,
+		},
+		{
+			name:   "should apply the offset",
+			status: emmq.StatusUnacked | emmq.StatusNacked,
+			opts: func(o *emmq.RedriveOptions) {
+				o.Offset = 1 * time.Minute
+			},
+		},
+		{
+			name:   "should apply the topic prefix",
+			status: emmq.StatusUnacked | emmq.StatusNacked,
+			opts: func(o *emmq.RedriveOptions) {
+				o.TopicPrefix = uuid.NewString()
+			},
 		},
 	}
 
@@ -233,7 +252,7 @@ func TestExchange_Redrive(t *testing.T) {
 				}
 			})
 
-			if err = sut.Redrive(tt.status); err != nil {
+			if err = sut.Redrive(tt.status, tt.opts); err != nil {
 				t.Fatal(err)
 			}
 
