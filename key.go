@@ -73,6 +73,10 @@ func (k Key) withStatus(s Status) Key {
 }
 
 func encodePrefix(topic string, s Status) []byte {
+	if topic == "" {
+		return []byte{byte(s)}
+	}
+
 	tb := []byte(topic)
 	tl := len(tb)
 	b := make([]byte, tl+1)

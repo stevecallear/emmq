@@ -3,6 +3,7 @@ package emmq
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -26,13 +27,20 @@ type (
 		PollInterval  time.Duration
 		PollBatchSize int
 		BadgerOptions badger.Options
-		OnError       func(badger.Logger, error)
+		OnError       func(error)
 	}
 
 	// PublishOptions represents message publish options
 	PublishOptions struct {
 		Wait  bool
 		Delay time.Duration
+	}
+
+	// RedriveOptions represents message redrive options
+	RedriveOptions struct {
+		TopicPrefix string
+		BatchSize   int
+		Offset      time.Duration
 	}
 
 	// Delivery represents a message delivery
@@ -49,8 +57,8 @@ func Open(path string, optFns ...func(*Options)) (*Exchange, error) {
 		PollInterval:  100 * time.Millisecond,
 		PollBatchSize: 10,
 		BadgerOptions: badger.DefaultOptions(path),
-		OnError: func(l badger.Logger, err error) {
-			l.Errorf("%v", err)
+		OnError: func(err error) {
+			log.Println(err)
 		},
 	}
 
@@ -169,7 +177,7 @@ func (e *Exchange) Consume(ctx context.Context, topicPrefix string) (<-chan Deli
 			case <-t.C:
 				ds, err := e.pop(topicPrefix, e.opts.PollBatchSize)
 				if err != nil {
-					e.opts.OnError(e.db.Opts().Logger, err)
+					e.opts.OnError(err)
 					continue
 				}
 
@@ -181,95 +189,6 @@ func (e *Exchange) Consume(ctx context.Context, topicPrefix string) (<-chan Deli
 	}()
 
 	return ch, nil
-}
-
-// Redrive redrives all messages of the specified status(es)
-func (e *Exchange) Redrive(s Status) error {
-	for _, cs := range []Status{StatusUnacked, StatusNacked} {
-		if hasStatus(s, cs) {
-			if err := e.redriveStatus(cs, e.opts.PollBatchSize); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (e *Exchange) redriveStatus(s Status, count int) error {
-	pre := []byte{byte(s)}
-	for {
-		var c int
-		var more bool
-		err := e.db.Update(func(tx *badger.Txn) error {
-			it := tx.NewIterator(badger.DefaultIteratorOptions)
-			defer it.Close()
-
-			for it.Seek(pre); it.ValidForPrefix(pre); it.Next() {
-				if !it.Valid() {
-					break
-				}
-
-				ii := it.Item()
-				k := Key(ii.KeyCopy(nil))
-
-				v, err := ii.ValueCopy(nil)
-				if err != nil {
-					return err
-				}
-
-				nk := k.withStatus(StatusReady)
-				if err := tx.Set(nk, v); err != nil {
-					return err
-				}
-
-				if err := tx.Delete(k); err != nil {
-					return err
-				}
-
-				c++
-				if c >= count {
-					more = true
-					break
-				}
-			}
-
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		if !more {
-			break
-		}
-	}
-
-	return nil
-}
-
-// Purge purges all messages of the specified status(es)
-func (e *Exchange) Purge(s Status) error {
-	ps := [][]byte{}
-	for _, cs := range []Status{StatusReady, StatusUnacked, StatusNacked} {
-		if hasStatus(s, cs) {
-			ps = append(ps, []byte{byte(cs)})
-		}
-	}
-
-	if len(ps) < 1 {
-		return nil
-	}
-
-	return e.db.DropPrefix(ps...)
-}
-
-// Close closes the exchange and the underlying database
-func (e *Exchange) Close() error {
-	close(e.quit)
-	e.wg.Wait()
-
-	return e.db.Close()
 }
 
 func (e *Exchange) pop(topic string, count int) ([]Delivery, error) {
@@ -326,6 +245,106 @@ func (e *Exchange) pop(topic string, count int) ([]Delivery, error) {
 	}
 
 	return res, nil
+}
+
+// Redrive redrives all messages of the specified status(es)
+func (e *Exchange) Redrive(s Status, optFns ...func(*RedriveOptions)) error {
+	o := RedriveOptions{BatchSize: e.opts.PollBatchSize}
+	for _, fn := range optFns {
+		fn(&o)
+	}
+
+	for _, cs := range []Status{StatusUnacked, StatusNacked} {
+		if hasStatus(s, cs) {
+			if err := e.redriveStatus(cs, o); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (e *Exchange) redriveStatus(s Status, o RedriveOptions) error {
+	pre := encodePrefix(o.TopicPrefix, s)
+	now := time.Now().UTC()
+
+	for {
+		var more bool
+		err := e.db.Update(func(tx *badger.Txn) error {
+			it := tx.NewIterator(badger.DefaultIteratorOptions)
+			defer it.Close()
+
+			var c int
+			for it.Seek(pre); it.ValidForPrefix(pre); it.Next() {
+				if !it.Valid() {
+					break
+				}
+
+				ii := it.Item()
+				k := Key(ii.KeyCopy(nil))
+
+				if o.Offset > 0 && k.DueAt().Add(o.Offset).After(now) {
+					break
+				}
+
+				v, err := ii.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+
+				nk := k.withStatus(StatusReady)
+				if err := tx.Set(nk, v); err != nil {
+					return err
+				}
+
+				if err := tx.Delete(k); err != nil {
+					return err
+				}
+
+				c++
+				if c >= o.BatchSize {
+					more = true
+					break
+				}
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		if !more {
+			break
+		}
+	}
+
+	return nil
+}
+
+// Purge purges all messages of the specified status(es)
+func (e *Exchange) Purge(s Status) error {
+	ps := [][]byte{}
+	for _, cs := range []Status{StatusReady, StatusUnacked, StatusNacked} {
+		if hasStatus(s, cs) {
+			ps = append(ps, []byte{byte(cs)})
+		}
+	}
+
+	if len(ps) < 1 {
+		return nil
+	}
+
+	return e.db.DropPrefix(ps...)
+}
+
+// Close closes the exchange and the underlying database
+func (e *Exchange) Close() error {
+	close(e.quit)
+	e.wg.Wait()
+
+	return e.db.Close()
 }
 
 func (e *Exchange) ack(k Key) error {
