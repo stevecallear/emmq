@@ -2,59 +2,42 @@ package emmq
 
 import (
 	"encoding/binary"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-type (
-	// Key represents a key
-	Key []byte
-
-	// Status represents a message status
-	Status uint8
-)
-
-const (
-	// StatusReady indicates that the message is ready
-	StatusReady Status = 1 << iota
-
-	// StatusUnacked indicates that the message has been consumed, but not acked
-	StatusUnacked
-
-	// StatusNacked indicates that the message has been consumed and nacked
-	StatusNacked
-)
+// Key represents a message key
+type Key []byte
 
 // NewKey returns a new key
-func NewKey(topic string, s Status, dueAt time.Time) Key {
-	tb := []byte(topic)
-	tl := len(tb)
+func NewKey(prefix string, dueAt time.Time) (Key, error) {
+	pb, err := encodePrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
 
-	k := make(Key, tl+25)
-	k[0] = byte(s)
-	copy(k[1:], []byte(topic))
+	pl := len(pb)
 
-	binary.BigEndian.PutUint64(k[tl+1:tl+9], uint64(dueAt.UnixNano()))
+	k := make(Key, pl+24)
+	copy(k, pb)
+
+	binary.BigEndian.PutUint64(k[pl:pl+8], uint64(dueAt.UnixNano()))
 	u := uuid.New()
-	copy(k[tl+9:], u[:])
+	copy(k[pl+8:], u[:])
 
-	return k
+	return k, nil
 }
 
-// Status returns the status byte for the key
-func (k Key) Status() Status {
-	return Status(k[0])
-}
-
-// Topic returns the topic for the key
-func (k Key) Topic() string {
-	return string(k[1 : len(k)-24])
+// Prefix returns the key prefix
+func (k Key) Prefix() []byte {
+	return k[:len(k)-24]
 }
 
 // DueAt returns the due at time for the key
 func (k Key) DueAt() time.Time {
-	ns := binary.BigEndian.Uint64(k[len(k)-24 : len(k)-8])
+	ns := binary.BigEndian.Uint64(k[len(k)-24 : len(k)-16])
 	return time.Unix(0, int64(ns)).UTC()
 }
 
@@ -65,26 +48,28 @@ func (k Key) UUID() uuid.UUID {
 	return u
 }
 
-func (k Key) withStatus(s Status) Key {
-	kc := make([]byte, len(k))
+// Delay returns a copy of the key with the specified due at delay
+func (k Key) Delay(d time.Duration) Key {
+	kc := make(Key, len(k))
 	copy(kc, k)
-	kc[0] = byte(s)
+
+	dueAt := k.DueAt().Add(d)
+	binary.BigEndian.PutUint64(kc[len(kc)-24:len(kc)-16], uint64(dueAt.UnixNano()))
+
 	return kc
 }
 
-func encodePrefix(topic string, s Status) []byte {
-	if topic == "" {
-		return []byte{byte(s)}
+func encodePrefix(prefix string) ([]byte, error) {
+	pb := []byte(prefix)
+
+	pl := len(pb)
+	if pl < 1 || pl > 255 {
+		return nil, errors.New("invalid prefix length")
 	}
 
-	tb := []byte(topic)
-	tl := len(tb)
-	b := make([]byte, tl+1)
-	b[0] = byte(s)
-	copy(b[1:], tb)
-	return b
-}
+	eb := make([]byte, pl+1)
+	eb[0] = byte(uint8(pl))
+	copy(eb[1:], pb)
 
-func hasStatus(s Status, cmp Status) bool {
-	return s&cmp != 0
+	return eb, nil
 }

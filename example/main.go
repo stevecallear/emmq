@@ -11,41 +11,33 @@ import (
 	"github.com/stevecallear/emmq"
 )
 
-const (
-	topic  = "topic"
-	dbPath = "messages"
-)
-
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	ex, err := emmq.Open(dbPath, emmq.WithPolling(100*time.Millisecond, 100))
+	e, err := emmq.Open("emmq", emmq.WithPolling(100*time.Millisecond, 100))
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer ex.Close()
+	defer e.Close()
 
-	// redrive all messages that have not been acked
-	if err := ex.Redrive(emmq.StatusUnacked); err != nil {
-		log.Fatal(err)
-	}
-
-	// purge all messages that have been explicitly nacked
-	if err := ex.Purge(emmq.StatusNacked); err != nil {
-		log.Fatal(err)
-	}
-
-	go consume(ctx, ex)
-	go publish(ctx, ex)
+	go consume(ctx, e, "topic")
+	go publish(ctx, e, "topic")
 
 	<-ctx.Done()
 }
 
-func consume(ctx context.Context, ex *emmq.Exchange) {
-	ch, err := ex.Consume(ctx, topic)
+func consume(ctx context.Context, e *emmq.Exchange, topic string) {
+	q, err := e.Declare("queue")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	q.Bind(topic)
+
+	c, err := q.Consume(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -54,16 +46,16 @@ func consume(ctx context.Context, ex *emmq.Exchange) {
 		select {
 		case <-ctx.Done():
 			return
-		case d := <-ch:
+		case d := <-c:
 			log.Printf("received: %s", d.Value)
-			if err := d.Ack(); err != nil {
+			if err := d.Delete(); err != nil {
 				log.Fatal(err)
 			}
 		}
 	}
 }
 
-func publish(ctx context.Context, ex *emmq.Exchange) {
+func publish(ctx context.Context, e *emmq.Exchange, topic string) {
 	var t *time.Timer
 	msgs := []string{"foo", "bar", "baz"}
 
@@ -76,7 +68,7 @@ func publish(ctx context.Context, ex *emmq.Exchange) {
 			return
 		case <-t.C:
 			m := msgs[rand.Intn(len(msgs))]
-			if err := ex.Publish(topic, []byte(m)); err != nil {
+			if err := e.Publish(topic, []byte(m)); err != nil {
 				log.Fatal(err)
 			}
 		}
