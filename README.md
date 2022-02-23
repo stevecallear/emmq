@@ -25,7 +25,7 @@ if err != nil {
 
 q.Bind("topic")
 
-c, err := e.Consume(context.Background(), "topic")
+c, err := q.Consume(context.Background())
 if err != nil {
     log.Fatal(err)
 }
@@ -34,7 +34,7 @@ if err = e.Publish("topic", []byte("value")); err != nil {
     log.Fatal(err)
 }
 
-d := <- c
+d := <-c
 log.Print(string(d.Value))
 
 if err = d.Delete(); err != nil {
