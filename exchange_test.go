@@ -1,97 +1,91 @@
 package emmq_test
 
 import (
-	"bytes"
 	"context"
-	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/stevecallear/emmq"
 )
 
-var (
-	sut          *emmq.Exchange
-	pollInterval = 100 * time.Millisecond
-)
+func TestExchange_Declare(t *testing.T) {
+	qn := uuid.NewString()
 
-func TestMain(m *testing.M) {
-	p := uniquePath()
-	defer func() {
-		if err := os.RemoveAll(p); err != nil {
-			panic(err)
-		}
-	}()
-
-	e, err := emmq.Open(p, emmq.WithPolling(100*time.Millisecond, 10))
-	if err != nil {
-		panic(err)
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *emmq.Exchange)
+		queue string
+	}{
+		{
+			name: "should return an error if the queue has already been declared",
+			setup: func(t *testing.T, e *emmq.Exchange) {
+				_, err := e.Declare(qn)
+				assertErrorExists(t, err, false)
+			},
+			queue: qn,
+		},
+		{
+			name:  "should return an error if the queue name is invalid",
+			setup: func(t *testing.T, e *emmq.Exchange) {},
+			queue: strings.Repeat("x", 256),
+		},
 	}
-	defer func() {
-		if err := e.Close(); err != nil {
-			panic(err)
-		}
-	}()
 
-	sut = e
-	m.Run()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup(t, sut)
+
+			_, err := sut.Declare(tt.queue)
+			assertErrorExists(t, err, true)
+		})
+	}
 }
 
 func TestExchange_Publish(t *testing.T) {
 	exp := []byte("value")
 
 	tests := []struct {
-		name        string
-		opts        func(*emmq.PublishOptions)
-		postConsume bool
-		assert      func(*testing.T, string, <-chan emmq.Delivery)
+		name   string
+		opts   func(*emmq.PublishOptions)
+		pre    bool
+		assert func(*testing.T, <-chan emmq.Delivery)
 	}{
 		{
 			name: "should publish immediate messages",
-			opts: func(*emmq.PublishOptions) {},
-			assert: func(t *testing.T, topic string, c <-chan emmq.Delivery) {
-				assertSome(t, c, 1, func(d emmq.Delivery) {
-					if act := d.Value; !bytes.Equal(act, exp) {
-						t.Errorf("got %v, expected %v", act, exp)
-					}
+			opts: func(o *emmq.PublishOptions) {},
+			assert: func(t *testing.T, c <-chan emmq.Delivery) {
+				assertDeliveries(t, c, 1, func(d emmq.Delivery) {
+					assertBytesEqual(t, d.Value, exp)
+				})
+			},
+		},
+		{
+			name: "should publish immediate messages pre consume",
+			opts: func(o *emmq.PublishOptions) {},
+			pre:  true,
+			assert: func(t *testing.T, c <-chan emmq.Delivery) {
+				assertDeliveries(t, c, 1, func(d emmq.Delivery) {
+					assertBytesEqual(t, d.Value, exp)
 				})
 			},
 		},
 		{
 			name: "should publish immediate wait messages",
 			opts: emmq.WithWait(),
-			assert: func(t *testing.T, topic string, c <-chan emmq.Delivery) {
-				assertSome(t, c, 1, func(d emmq.Delivery) {
-					if act := d.Value; !bytes.Equal(act, exp) {
-						t.Errorf("got %v, expected %v", act, exp)
-					}
-				})
-			},
-		},
-		{
-			name:        "should publish immediate messages with post consume",
-			opts:        func(*emmq.PublishOptions) {},
-			postConsume: true,
-			assert: func(t *testing.T, topic string, c <-chan emmq.Delivery) {
-				assertSome(t, c, 1, func(d emmq.Delivery) {
-					if act := d.Value; !bytes.Equal(act, exp) {
-						t.Errorf("got %v, expected %v", act, exp)
-					}
+			assert: func(t *testing.T, c <-chan emmq.Delivery) {
+				assertDeliveries(t, c, 1, func(d emmq.Delivery) {
+					assertBytesEqual(t, d.Value, exp)
 				})
 			},
 		},
 		{
 			name: "should publish delayed messages",
 			opts: emmq.WithDelay(2 * pollInterval),
-			assert: func(t *testing.T, topic string, c <-chan emmq.Delivery) {
-				assertSome(t, c, 1, func(d emmq.Delivery) {
-					if act := d.Value; !bytes.Equal(act, exp) {
-						t.Errorf("got %v, expected %v", act, exp)
-					}
+			assert: func(t *testing.T, c <-chan emmq.Delivery) {
+				assertDeliveries(t, c, 1, func(d emmq.Delivery) {
+					assertBytesEqual(t, d.Value, exp)
 				})
 			},
 		},
@@ -99,393 +93,54 @@ func TestExchange_Publish(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			qn, tn := uuid.NewString(), uuid.NewString()
 
-			topic := uuid.NewString()
+			q, err := sut.Declare(qn)
+			assertErrorExists(t, err, false)
 
-			var ch <-chan emmq.Delivery
-			var err error
+			q.Bind(tn)
 
-			if !tt.postConsume {
-				ch, err = sut.Consume(ctx, topic)
-				if err != nil {
-					t.Fatal(err)
-				}
+			if tt.pre {
+				err = sut.Publish(tn, exp, tt.opts)
+				assertErrorExists(t, err, false)
 			}
 
-			if err = sut.Publish(topic, exp, tt.opts); err != nil {
-				t.Fatal(err)
+			c, err := q.Consume(context.Background())
+			assertErrorExists(t, err, false)
+
+			if !tt.pre {
+				err = sut.Publish(tn, exp, tt.opts)
+				assertErrorExists(t, err, false)
 			}
 
-			if tt.postConsume {
-				ch, err = sut.Consume(ctx, topic)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			tt.assert(t, topic, ch)
+			tt.assert(t, c)
 		})
 	}
 }
 
-func TestExchange_Consume(t *testing.T) {
-	tests := []struct {
-		name   string
-		topics func() (string, string)
-	}{
-		{
-			name: "should return an error if the topic has already been consumed",
-			topics: func() (string, string) {
-				t := uuid.NewString()
-				return t, t
-			},
-		},
-		{
-			name: "should return an error if the topic prefix would mask an existing channel",
-			topics: func() (string, string) {
-				p := "p1."
-				t := uuid.NewString()
-				return p + t, p
-			},
-		},
+func TestExchange_PurgeAll(t *testing.T) {
+	t.Run("should purge all messages", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-		{
-			name: "should return an error if the topic prefix would be masked by an existing channel",
-			topics: func() (string, string) {
-				p := "p2."
-				t := uuid.NewString()
-				return p, p + t
-			},
-		},
-	}
+		e, close := newExchange(emmq.WithPolling(pollInterval, 10))
+		defer close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t1, t2 := tt.topics()
+		q, err := e.Declare(uuid.NewString())
+		assertErrorExists(t, err, false)
 
-			_, err := sut.Consume(context.Background(), t1)
-			if err != nil {
-				t.Fatal(err)
-			}
+		tn := uuid.NewString()
+		q.Bind(tn)
 
-			_, err = sut.Consume(context.Background(), t2)
-			if err == nil {
-				t.Error("got nil, expected an error")
-			}
-		})
-	}
-}
+		c, err := q.Consume(ctx)
+		assertErrorExists(t, err, false)
 
-func TestExchange_Redrive(t *testing.T) {
-	const messageCount = 30
+		err = e.Publish(tn, []byte{}, emmq.WithWait())
+		assertErrorExists(t, err, false)
 
-	tests := []struct {
-		name   string
-		status emmq.Status
-		opts   func(*emmq.RedriveOptions)
-		exp    int32
-	}{
-		{
-			name:   "should not error on ready status",
-			status: emmq.StatusReady,
-			opts:   func(*emmq.RedriveOptions) {},
-		},
-		{
-			name:   "should redrive unacked status",
-			status: emmq.StatusUnacked,
-			opts:   func(*emmq.RedriveOptions) {},
-			exp:    messageCount / 2,
-		},
-		{
-			name:   "should redrive nacked status",
-			status: emmq.StatusNacked,
-			opts:   func(*emmq.RedriveOptions) {},
-			exp:    messageCount / 2,
-		},
-		{
-			name:   "should redrive unacked and nacked status",
-			status: emmq.StatusUnacked | emmq.StatusNacked,
-			opts:   func(*emmq.RedriveOptions) {},
-			exp:    messageCount,
-		},
-		{
-			name:   "should apply the offset",
-			status: emmq.StatusUnacked | emmq.StatusNacked,
-			opts: func(o *emmq.RedriveOptions) {
-				o.Offset = 1 * time.Minute
-			},
-		},
-		{
-			name:   "should apply the topic prefix",
-			status: emmq.StatusUnacked | emmq.StatusNacked,
-			opts: func(o *emmq.RedriveOptions) {
-				o.TopicPrefix = uuid.NewString()
-			},
-		},
-	}
+		err = e.PurgeAll()
+		assertErrorExists(t, err, false)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			topic := uuid.NewString()
-
-			ch, err := sut.Consume(ctx, topic)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			for i := 0; i < messageCount; i++ {
-				if err := sut.Publish(topic, []byte{}); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			assertSome(t, ch, messageCount/2)
-
-			assertSome(t, ch, messageCount/2, func(d emmq.Delivery) {
-				if err := d.Nack(); err != nil {
-					t.Fatal(err)
-				}
-			})
-
-			if err = sut.Redrive(tt.status, tt.opts); err != nil {
-				t.Fatal(err)
-			}
-
-			if tt.exp < 1 {
-				assertNone(t, ch, 2*pollInterval)
-			} else {
-				assertSome(t, ch, tt.exp, func(d emmq.Delivery) {
-					if err := d.Ack(); err != nil {
-						t.Fatal(err)
-					}
-				})
-			}
-		})
-	}
-}
-
-func TestExchange_Purge(t *testing.T) {
-	tests := []struct {
-		name   string
-		setup  func(*testing.T, <-chan emmq.Delivery, string)
-		status emmq.Status
-		assert func(*testing.T, <-chan emmq.Delivery, string)
-	}{
-		{
-			name: "should do nothing on invalid status",
-			setup: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				for i := 0; i < 15; i++ {
-					err := sut.Publish(topic, []byte{}, emmq.WithDelay(2*pollInterval))
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-			},
-			status: emmq.Status(1 << 4),
-			assert: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				assertSome(t, ch, 15)
-			},
-		},
-		{
-			name: "should purge ready status",
-			setup: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				for i := 0; i < 15; i++ {
-					err := sut.Publish(topic, []byte{}, emmq.WithDelay(2*pollInterval))
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-			},
-			status: emmq.StatusReady,
-			assert: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				assertNone(t, ch, 4*pollInterval)
-			},
-		},
-		{
-			name: "should purge unacked status",
-			setup: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				for i := 0; i < 15; i++ {
-					if err := sut.Publish(topic, []byte{}); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				assertSome(t, ch, 15)
-			},
-			status: emmq.StatusUnacked,
-			assert: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				if err := sut.Redrive(emmq.StatusUnacked); err != nil {
-					t.Fatal(err)
-				}
-
-				assertNone(t, ch, 2*pollInterval)
-			},
-		},
-		{
-			name: "should purge nacked status",
-			setup: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				for i := 0; i < 15; i++ {
-					if err := sut.Publish(topic, []byte{}); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				assertSome(t, ch, 15, func(d emmq.Delivery) {
-					if err := d.Nack(); err != nil {
-						t.Fatal(err)
-					}
-				})
-			},
-			status: emmq.StatusNacked,
-			assert: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				if err := sut.Redrive(emmq.StatusNacked); err != nil {
-					t.Fatal(err)
-				}
-
-				assertNone(t, ch, 2*pollInterval)
-			},
-		},
-		{
-			name: "should purge unacked and nacked status",
-			setup: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				for i := 0; i < 30; i++ {
-					if err := sut.Publish(topic, []byte{}); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				assertSome(t, ch, 15)
-
-				assertSome(t, ch, 15, func(d emmq.Delivery) {
-					if err := d.Nack(); err != nil {
-						t.Fatal(err)
-					}
-				})
-			},
-			status: emmq.StatusUnacked | emmq.StatusNacked,
-			assert: func(t *testing.T, ch <-chan emmq.Delivery, topic string) {
-				if err := sut.Redrive(emmq.StatusUnacked | emmq.StatusNacked); err != nil {
-					t.Fatal(err)
-				}
-
-				assertNone(t, ch, 2*pollInterval)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			topic := uuid.NewString()
-
-			ch, err := sut.Consume(ctx, topic)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			tt.setup(t, ch, topic)
-
-			if err := sut.Purge(tt.status); err != nil {
-				t.Fatal(err)
-			}
-
-			tt.assert(t, ch, topic)
-		})
-	}
-}
-
-func TestExchange_Close(t *testing.T) {
-	t.Run("should close the exchange", func(t *testing.T) {
-		p := uniquePath()
-		defer func() {
-			if err := os.RemoveAll(p); err != nil {
-				t.Fatal(err)
-			}
-		}()
-
-		e, err := emmq.Open(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		_, err = e.Consume(context.Background(), "topic")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err = e.Close(); err != nil {
-			t.Fatal(err)
-		}
+		assertNoDeliveries(t, c, 2*pollInterval)
 	})
-}
-
-func TestWithPolling(t *testing.T) {
-	t.Run("should configure polling", func(t *testing.T) {
-		var o emmq.Options
-		emmq.WithPolling(1*time.Second, 10)(&o)
-
-		if act, exp := o.PollInterval, 1*time.Second; act != exp {
-			t.Errorf("got %v, expected %v", act, exp)
-		}
-
-		if act, exp := o.PollBatchSize, 10; act != exp {
-			t.Errorf("got %d, expected %d", act, exp)
-		}
-	})
-}
-
-func assertSome(t *testing.T, ch <-chan emmq.Delivery, n int32, fns ...func(emmq.Delivery)) {
-	q := make(chan struct{})
-
-	var c int32
-	go func() {
-		defer close(q)
-		for {
-			d := <-ch
-
-			ct := atomic.AddInt32(&c, 1)
-			for _, fn := range fns {
-				fn(d)
-			}
-
-			if ct >= n {
-				return
-			}
-		}
-	}()
-
-	tt := time.NewTimer(5 * time.Second)
-	for {
-		select {
-		case <-q:
-			return
-		case <-tt.C:
-			t.Error("expected a delivery, got none")
-			return
-		}
-	}
-}
-
-func assertNone(t *testing.T, ch <-chan emmq.Delivery, wait time.Duration) {
-	dt := time.NewTimer(wait)
-	for {
-		select {
-		case <-ch:
-			t.Error("got delivery, expected none")
-			return
-		case <-dt.C:
-			return
-		}
-	}
-}
-
-func uniquePath() string {
-	return "test-" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
